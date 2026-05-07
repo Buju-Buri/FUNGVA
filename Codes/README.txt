@@ -3,7 +3,7 @@ Code Structure and Usage
 This folder contains all scripts required for model training and test data evaluation.
 
 ADNI Data Structure
-- adni_data.R: Formats the FC and corresponding datasets for further downstream analysis.
+- adni_data.R: Formats the FC and corresponding covariate datasets for further downstream analysis.
 
 MODEL DEFINITIONS
 - FUNGVA_model_definition.R: Defines the proposed FUNGVA model.

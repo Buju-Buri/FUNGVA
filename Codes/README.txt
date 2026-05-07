@@ -2,6 +2,9 @@ Code Structure and Usage
 
 This folder contains all scripts required for model training and test data evaluation.
 
+ADNI Data Structure
+- adni_data.R: Formats the FC and corresponding datasets for further downstream analysis.
+
 MODEL DEFINITIONS
 - FUNGVA_model_definition.R: Defines the proposed FUNGVA model.
 - MLP_FiLM1_model_definition.R, MLP_FiLM2_model_definition.R: Define the competing VAE models with FiLM-based decoders.

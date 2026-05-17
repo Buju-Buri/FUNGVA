@@ -1,0 +1,803 @@
+#!/usr/bin/env python3
+"""
+Standalone Python version of the FUNGVA ld12 lambda=0.1 workflow.
+
+This combines the dataset construction, model definition, VAE loss/metrics,
+and multi-seed training loop into one script.
+
+It preserves the statistical goal of the original R/luz workflow:
+    loss = reconstruction_loss + KL_loss + lambda_pen * cross_cov_penalty
+with latent_dim=12, lambda_pen=0.1, max_lr=0.025270402, epochs=800,
+patience=30, and seeds 101, 202, 303.
+
+Expected files in --workdir:
+    fc_train.rds
+    fc_val.rds
+    fc_test.rds
+    covariates.rds
+
+Dependencies:
+    pip install numpy pandas torch pyreadr
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import os
+import random
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+from torch.optim.lr_scheduler import OneCycleLR
+from torch.utils.data import DataLoader, Dataset
+
+
+# -----------------------------------------------------------------------------
+# Reproducibility helpers
+# -----------------------------------------------------------------------------
+
+def set_seed(seed_id: int) -> None:
+    random.seed(seed_id)
+    np.random.seed(seed_id)
+    torch.manual_seed(seed_id)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed_id)
+        torch.cuda.manual_seed_all(seed_id)
+
+
+# -----------------------------------------------------------------------------
+# RDS loading and dataset construction
+# -----------------------------------------------------------------------------
+
+def read_rds(path: os.PathLike[str] | str) -> Any:
+    """Read a single-object .rds file using pyreadr."""
+    try:
+        import pyreadr
+    except ImportError as exc:
+        raise ImportError(
+            "pyreadr is required to read .rds files. Install it with: pip install pyreadr"
+        ) from exc
+
+    result = pyreadr.read_r(str(path))
+    if len(result) == 0:
+        raise ValueError(f"No objects found in RDS file: {path}")
+    return next(iter(result.values()))
+
+
+def as_matrix_list(fc_obj: Any) -> List[np.ndarray]:
+    """
+    Convert a loaded R object into a list of 68 x 68 numpy matrices.
+
+    This handles common pyreadr outputs: dict-like, list-like, a single 68x68
+    DataFrame, or a DataFrame with each row containing flattened 68x68 values.
+    """
+    if isinstance(fc_obj, dict):
+        mats = [np.asarray(v, dtype=np.float32) for v in fc_obj.values()]
+    elif isinstance(fc_obj, (list, tuple)):
+        mats = [np.asarray(v, dtype=np.float32) for v in fc_obj]
+    elif isinstance(fc_obj, pd.DataFrame):
+        if fc_obj.shape == (68, 68):
+            mats = [fc_obj.to_numpy(dtype=np.float32)]
+        else:
+            mats = []
+            # Case: n rows, 4624 columns, one flattened matrix per row.
+            if fc_obj.shape[1] == 68 * 68:
+                for _, row in fc_obj.iterrows():
+                    mats.append(row.to_numpy(dtype=np.float32).reshape(68, 68))
+            else:
+                # Case: cells may contain array-like matrix objects.
+                for _, row in fc_obj.iterrows():
+                    values = row.to_numpy()
+                    if len(values) == 1:
+                        arr = np.asarray(values[0], dtype=np.float32)
+                        if arr.size == 68 * 68:
+                            mats.append(arr.reshape(68, 68))
+    else:
+        mats = []
+
+    if not mats:
+        raise TypeError(
+            "Could not automatically convert the FC object into a list of 68 x 68 matrices. "
+            "Inspect the object returned by pyreadr.read_r() and adapt as_matrix_list()."
+        )
+
+    checked = []
+    for i, mat in enumerate(mats):
+        mat = np.asarray(mat, dtype=np.float32)
+        if mat.shape != (68, 68):
+            raise ValueError(f"FC matrix {i} has shape {mat.shape}; expected (68, 68).")
+        checked.append(mat)
+    return checked
+
+
+def rank_first(row: np.ndarray) -> np.ndarray:
+    """Equivalent to R rank(row, ties.method='first'), returning 1-based ranks."""
+    order = np.argsort(row, kind="stable")
+    ranks = np.empty_like(order, dtype=np.float32)
+    ranks[order] = np.arange(1, len(row) + 1, dtype=np.float32)
+    return ranks
+
+
+def make_masks(fc_train: Sequence[np.ndarray], n_size: int = 2) -> List[torch.Tensor]:
+    """Create the six decoder masks used by the FUNGVA graph decoder."""
+    fc_train_array = 1.0 - np.stack(fc_train, axis=0).astype(np.float32)
+    a_mat = np.mean(fc_train_array, axis=0)
+    ranks = np.vstack([rank_first(row) for row in a_mat])
+
+    masks_np = [
+        (ranks < (n_size**1 + 1)).astype(np.float32),
+        (ranks < (n_size**2 + 1)).astype(np.float32),
+        (ranks < (n_size**3 + 1)).astype(np.float32),
+        (ranks < (n_size**4 + 1)).astype(np.float32),
+        (ranks < (n_size**5 + 1)).astype(np.float32),
+        np.eye((68 * 67) // 2, dtype=np.float32),
+    ]
+    return [torch.tensor(m, dtype=torch.float32) for m in masks_np]
+
+
+def lt_rowwise(mat: np.ndarray) -> np.ndarray:
+    """Extract strict lower triangle row by row, matching the R lt_rowwise function."""
+    mat = np.asarray(mat, dtype=np.float32)
+    p = mat.shape[0]
+    out = np.empty((p * (p - 1)) // 2, dtype=np.float32)
+    k = 0
+    for i in range(1, p):
+        out[k : k + i] = mat[i, :i]
+        k += i
+    return out
+
+
+def get_subject_ids(fc_obj: Sequence[np.ndarray], fallback_prefix: str) -> np.ndarray:
+    """
+    Return subject IDs for covariate alignment.
+
+    Python RDS loading often loses R row names. This default mirrors the previous
+    conversion by using 1..n as strings. If your RDS objects carry real IDs, adapt
+    this function to extract them.
+    """
+    del fallback_prefix
+    return np.array([str(i + 1) for i in range(len(fc_obj))], dtype=str)
+
+
+def align_covariates(cov_df: pd.DataFrame, ids: np.ndarray) -> pd.DataFrame:
+    """Filter and order covariates to exactly match a vector of subject IDs."""
+    if "RID" not in cov_df.columns:
+        raise KeyError("covariates.rds must contain a column named 'RID'.")
+
+    ids_str = pd.Index(ids.astype(str), name="RID")
+    cov_df = cov_df.copy()
+    cov_df["RID"] = cov_df["RID"].astype(str)
+
+    available = set(cov_df["RID"])
+    missing = [x for x in ids_str if x not in available]
+    if missing:
+        raise KeyError(
+            f"{len(missing)} subject IDs were not found in covariates.RID. "
+            f"First missing IDs: {missing[:10]}. If your RDS row names were lost, "
+            "edit get_subject_ids() to recover the true IDs."
+        )
+
+    return cov_df.set_index("RID").loc[ids_str].reset_index()
+
+
+def scale_with_train(
+    df: pd.DataFrame,
+    vars_: Sequence[str],
+    means: pd.Series,
+    sds: pd.Series,
+) -> np.ndarray:
+    x = df[list(vars_)].to_numpy(dtype=np.float32)
+    denom = sds.to_numpy(dtype=np.float32)
+    if np.any(denom == 0):
+        raise ValueError(f"At least one training covariate SD is zero: {list(sds.index[denom == 0])}")
+    return (x - means.to_numpy(dtype=np.float32)) / denom
+
+
+class FungvaDataset(Dataset):
+    def __init__(self, fc_mat: np.ndarray, cov_mat: np.ndarray):
+        if fc_mat.shape[0] != cov_mat.shape[0]:
+            raise ValueError("fc_mat and cov_mat must have the same number of rows.")
+        self.fc_mat = torch.tensor(fc_mat, dtype=torch.float32)
+        self.cov_mat = torch.tensor(cov_mat, dtype=torch.float32)
+        self.n = int(fc_mat.shape[0])
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, i: int) -> Dict[str, Any]:
+        fc = self.fc_mat[i]
+        cov = self.cov_mat[i]
+        return {"x": {"fc": fc, "cov": cov}, "y": fc, "indices": i}
+
+
+def collate_fungva_batch(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    fc = torch.stack([item["x"]["fc"] for item in batch], dim=0)
+    cov = torch.stack([item["x"]["cov"] for item in batch], dim=0)
+    y = torch.stack([item["y"] for item in batch], dim=0)
+    indices = torch.tensor([item["indices"] for item in batch], dtype=torch.long)
+    return {"x": {"fc": fc, "cov": cov}, "y": y, "indices": indices}
+
+
+def build_dataloaders(
+    workdir: os.PathLike[str] | str,
+    train_batch_size: int = 16,
+    eval_batch_size: int = 15,
+) -> Tuple[DataLoader, DataLoader, DataLoader, List[torch.Tensor], int]:
+    """Load RDS files and construct train/validation/test DataLoaders."""
+    workdir = Path(workdir).expanduser().resolve()
+    if not workdir.exists():
+        raise FileNotFoundError(f"Workdir does not exist: {workdir}")
+
+    fc_train_raw = read_rds(workdir / "fc_train.rds")
+    fc_val_raw = read_rds(workdir / "fc_val.rds")
+    fc_test_raw = read_rds(workdir / "fc_test.rds")
+    cov_df = read_rds(workdir / "covariates.rds")
+    if not isinstance(cov_df, pd.DataFrame):
+        raise TypeError("covariates.rds must load as a pandas DataFrame.")
+
+    fc_train = as_matrix_list(fc_train_raw)
+    fc_val = as_matrix_list(fc_val_raw)
+    fc_test = as_matrix_list(fc_test_raw)
+
+    masks = make_masks(fc_train)
+
+    fc_train_matrix = np.vstack([lt_rowwise(m) for m in fc_train])
+    fc_val_matrix = np.vstack([lt_rowwise(m) for m in fc_val])
+    fc_test_matrix = np.vstack([lt_rowwise(m) for m in fc_test])
+
+    eps = np.float32(1e-6)
+    fc_train_atanh = np.arctanh(np.clip(fc_train_matrix, -1 + eps, 1 - eps)).astype(np.float32)
+    fc_val_atanh = np.arctanh(np.clip(fc_val_matrix, -1 + eps, 1 - eps)).astype(np.float32)
+    fc_test_atanh = np.arctanh(np.clip(fc_test_matrix, -1 + eps, 1 - eps)).astype(np.float32)
+
+    train_ids = get_subject_ids(fc_train, "train")
+    val_ids = get_subject_ids(fc_val, "val")
+    test_ids = get_subject_ids(fc_test, "test")
+
+    num_vars = ["AGE", "EDUCATION", "pTau_ratio_log", "abeta_ratio_log"]
+    other_vars = ["SEX", "PARTNERED", "APOE4"]
+    required = ["RID", *num_vars, *other_vars]
+    missing_cols = [c for c in required if c not in cov_df.columns]
+    if missing_cols:
+        raise KeyError(f"Missing required covariate columns: {missing_cols}")
+
+    cov_train = align_covariates(cov_df, train_ids)
+    cov_val = align_covariates(cov_df, val_ids)
+    cov_test = align_covariates(cov_df, test_ids)
+
+    train_means = cov_train[num_vars].mean(skipna=True)
+    train_sds = cov_train[num_vars].std(skipna=True, ddof=1)
+
+    cov_num_train = scale_with_train(cov_train, num_vars, train_means, train_sds)
+    cov_num_val = scale_with_train(cov_val, num_vars, train_means, train_sds)
+    cov_num_test = scale_with_train(cov_test, num_vars, train_means, train_sds)
+
+    cov_other_train = cov_train[other_vars].to_numpy(dtype=np.float32)
+    cov_other_val = cov_val[other_vars].to_numpy(dtype=np.float32)
+    cov_other_test = cov_test[other_vars].to_numpy(dtype=np.float32)
+
+    cov_train_mat = np.column_stack([cov_num_train, cov_other_train]).astype(np.float32)
+    cov_val_mat = np.column_stack([cov_num_val, cov_other_val]).astype(np.float32)
+    cov_test_mat = np.column_stack([cov_num_test, cov_other_test]).astype(np.float32)
+    cov_dim = int(cov_train_mat.shape[1])
+
+    train_ds = FungvaDataset(fc_train_atanh, cov_train_mat)
+    val_ds = FungvaDataset(fc_val_atanh, cov_val_mat)
+    test_ds = FungvaDataset(fc_test_atanh, cov_test_mat)
+
+    set_seed(1)
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=train_batch_size,
+        shuffle=True,
+        collate_fn=collate_fungva_batch,
+    )
+    val_dl = DataLoader(
+        val_ds,
+        batch_size=eval_batch_size,
+        shuffle=False,
+        collate_fn=collate_fungva_batch,
+    )
+    test_dl = DataLoader(
+        test_ds,
+        batch_size=eval_batch_size,
+        shuffle=False,
+        collate_fn=collate_fungva_batch,
+    )
+    return train_dl, val_dl, test_dl, masks, cov_dim
+
+
+# -----------------------------------------------------------------------------
+# Model definition
+# -----------------------------------------------------------------------------
+
+class GraphCNN(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.mask: Optional[torch.Tensor] = None
+
+    def set_mask(self, mask: torch.Tensor | np.ndarray) -> None:
+        if not torch.is_tensor(mask):
+            mask = torch.tensor(mask, dtype=self.linear.weight.dtype)
+        self.mask = mask.detach().to(dtype=self.linear.weight.dtype, device=self.linear.weight.device)
+        self.mask.requires_grad_(False)
+        if self.mask.shape != self.linear.weight.shape:
+            raise ValueError(
+                f"Mask shape {tuple(self.mask.shape)} does not match weight shape "
+                f"{tuple(self.linear.weight.shape)}."
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mask is not None:
+            return F.linear(x, self.linear.weight * self.mask, self.linear.bias)
+        return self.linear(x)
+
+
+class FUNGVA(nn.Module):
+    def __init__(self, latent_dim: int, cov_dim: int):
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.cov_dim = int(cov_dim)
+        p = (68 * 67) // 2
+
+        idx = torch.tril(torch.ones(68, 68, dtype=torch.bool), diagonal=-1).nonzero(as_tuple=False)
+        self.register_buffer("lt_flat_idx", (idx[:, 0] * 68 + idx[:, 1]).long())
+
+        self.en_mu_la1 = nn.Linear(p, 1024, bias=False)
+        self.en_var_la1 = nn.Linear(p, 1024, bias=False)
+        self.en_mu_la2 = nn.Linear(1024, 128, bias=False)
+        self.en_var_la2 = nn.Linear(1024, 128, bias=False)
+        self.en_mu_la3 = nn.Linear(128, latent_dim)
+        self.en_var_la3 = nn.Linear(128, latent_dim)
+
+        self.dc1_la1 = nn.Linear(latent_dim, 68)
+        self.dc2_la1 = nn.Linear(latent_dim, 68)
+        self.dc3_la1 = nn.Linear(latent_dim, 68)
+        self.dc4_la1 = nn.Linear(latent_dim, 68)
+        self.dc5_la1 = nn.Linear(latent_dim, 68)
+
+        self.dc1_la2 = GraphCNN(68, 68)
+        self.dc2_la2 = GraphCNN(68, 68)
+        self.dc3_la2 = GraphCNN(68, 68)
+        self.dc4_la2 = GraphCNN(68, 68)
+        self.dc5_la2 = GraphCNN(68, 68)
+        self.dcintercept = GraphCNN(p, p)
+
+        film_hidden = 32
+        self.film1 = nn.Sequential(nn.Linear(cov_dim, film_hidden), nn.ReLU(), nn.Linear(film_hidden, 2 * 68))
+        self.film2 = nn.Sequential(nn.Linear(cov_dim, film_hidden), nn.ReLU(), nn.Linear(film_hidden, 2 * 68))
+        self.film3 = nn.Sequential(nn.Linear(cov_dim, film_hidden), nn.ReLU(), nn.Linear(film_hidden, 2 * 68))
+        self.film4 = nn.Sequential(nn.Linear(cov_dim, film_hidden), nn.ReLU(), nn.Linear(film_hidden, 2 * 68))
+        self.film5 = nn.Sequential(nn.Linear(cov_dim, film_hidden), nn.ReLU(), nn.Linear(film_hidden, 2 * 68))
+        self.tanh_act = nn.Tanh()
+
+    def set_mask(self, masks: Sequence[torch.Tensor | np.ndarray]) -> None:
+        if len(masks) != 6:
+            raise ValueError(f"Expected exactly 6 masks; got {len(masks)}.")
+        self.dc1_la2.set_mask(masks[0])
+        self.dc2_la2.set_mask(masks[1])
+        self.dc3_la2.set_mask(masks[2])
+        self.dc4_la2.set_mask(masks[3])
+        self.dc5_la2.set_mask(masks[4])
+        self.dcintercept.set_mask(masks[5])
+
+    def encode(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        mu = F.relu(self.en_mu_la1(x))
+        mu = F.relu(self.en_mu_la2(mu))
+        mu = self.en_mu_la3(mu)
+
+        logvar = F.relu(self.en_var_la1(x))
+        logvar = F.relu(self.en_var_la2(logvar))
+        logvar = self.en_var_la3(logvar)
+        return {"mu": mu, "logvar": logvar}
+
+    @staticmethod
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    @staticmethod
+    def film_modulate(h: torch.Tensor, cov: torch.Tensor, film_net: nn.Module) -> torch.Tensor:
+        film_params = film_net(cov)
+        gamma = film_params[:, :68]
+        beta = film_params[:, 68:136]
+        return (1 + gamma) * h + beta
+
+    def _decode_head(
+        self,
+        z: torch.Tensor,
+        cov: torch.Tensor,
+        dc_la1: nn.Module,
+        dc_la2: nn.Module,
+        film_net: nn.Module,
+    ) -> torch.Tensor:
+        dcl_pre = F.relu(dc_la1(z))
+        dcl_mod = self.film_modulate(dcl_pre, cov, film_net)
+        dcl = dc_la2(dcl_mod)
+        dcl_out = torch.bmm(dcl.unsqueeze(2), dcl.unsqueeze(1))
+        dcl_vec = dcl_out.reshape(dcl_out.shape[0], 68 * 68)
+        return dcl_vec.index_select(dim=1, index=self.lt_flat_idx)
+
+    def decode(self, z: torch.Tensor, cov: torch.Tensor) -> Dict[str, torch.Tensor]:
+        dcl_out = (
+            self._decode_head(z, cov, self.dc1_la1, self.dc1_la2, self.film1)
+            + self._decode_head(z, cov, self.dc2_la1, self.dc2_la2, self.film2)
+            + self._decode_head(z, cov, self.dc3_la1, self.dc3_la2, self.film3)
+            + self._decode_head(z, cov, self.dc4_la1, self.dc4_la2, self.film4)
+            + self._decode_head(z, cov, self.dc5_la1, self.dc5_la2, self.film5)
+        )
+        dc_output = self.dcintercept(dcl_out)
+        return {"recon": dc_output, "fc_pred": self.tanh_act(dc_output)}
+
+    def forward(self, x: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        fc = x["fc"]
+        cov = x["cov"]
+        enc = self.encode(fc)
+        mu = enc["mu"]
+        logvar = enc["logvar"]
+        z = self.reparameterize(mu, logvar)
+        dec = self.decode(z, cov)
+        return {
+            "recon": dec["recon"],
+            "mu": mu,
+            "logvar": logvar,
+            "fc_pred": dec["fc_pred"],
+            "z": z,
+            "cov": cov,
+        }
+
+
+class FUNGVA_Trainer(nn.Module):
+    def __init__(self, latent_dim: int, cov_dim: int, masks: Optional[Sequence[torch.Tensor | np.ndarray]] = None):
+        super().__init__()
+        self.model = FUNGVA(latent_dim=latent_dim, cov_dim=cov_dim)
+        if masks is not None:
+            self.model.set_mask(masks)
+
+    def forward(self, x: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return self.model(x)
+
+
+# -----------------------------------------------------------------------------
+# Loss and metrics
+# -----------------------------------------------------------------------------
+
+def _get(preds: Any, name: str) -> torch.Tensor:
+    if isinstance(preds, dict):
+        return preds[name]
+    return getattr(preds, name)
+
+
+def cross_cov_penalty(mu: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
+    B = mu.size(0)
+    mu_c = mu - mu.mean(dim=0, keepdim=True)
+    cov_c = cov - cov.mean(dim=0, keepdim=True)
+    cov_mat = torch.matmul(mu_c.t(), cov_c) / max(B - 1, 1)
+    return torch.mean(cov_mat.pow(2))
+
+
+def make_vae_loss(lambda_pen: float = 0.0) -> Callable[[Any, torch.Tensor], torch.Tensor]:
+    def vae_loss(preds: Any, target: torch.Tensor) -> torch.Tensor:
+        recon = _get(preds, "recon")
+        mu = _get(preds, "mu")
+        logvar = _get(preds, "logvar")
+        cov = _get(preds, "cov")
+        B = target.size(0)
+        recon_loss = 0.5 * F.mse_loss(recon, target, reduction="sum") / B
+        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - torch.exp(logvar)) / B
+        pen = cross_cov_penalty(mu, cov)
+        return recon_loss + kl + lambda_pen * pen
+    return vae_loss
+
+
+def recon_metric(preds: Any, target: torch.Tensor) -> float:
+    val = 0.5 * F.mse_loss(_get(preds, "recon"), target, reduction="sum") / target.size(0)
+    return float(val.detach().cpu().item())
+
+
+def kl_metric(preds: Any, target: Optional[torch.Tensor] = None) -> float:
+    del target
+    mu = _get(preds, "mu")
+    logvar = _get(preds, "logvar")
+    val = -0.5 * torch.sum(1 + logvar - mu.pow(2) - torch.exp(logvar)) / mu.size(0)
+    return float(val.detach().cpu().item())
+
+
+def pen_metric(preds: Any, target: Optional[torch.Tensor] = None) -> float:
+    del target
+    return float(cross_cov_penalty(_get(preds, "mu"), _get(preds, "cov")).detach().cpu().item())
+
+
+class RunningMeanMetric:
+    def __init__(self, metric_fn: Callable[[Any, torch.Tensor], float]):
+        self.metric_fn = metric_fn
+        self.reset()
+
+    def reset(self) -> None:
+        self.sum = 0.0
+        self.n = 0
+
+    @torch.no_grad()
+    def update(self, preds: Any, target: torch.Tensor) -> None:
+        B = target.size(0)
+        self.sum += self.metric_fn(preds, target) * B
+        self.n += B
+
+    def compute(self) -> float:
+        return self.sum / max(self.n, 1)
+
+
+class ActiveDimsRunningMetric:
+    def __init__(self, threshold: float = 0.01):
+        self.threshold = threshold
+        self.reset()
+
+    def reset(self) -> None:
+        self.kl_sum: Optional[torch.Tensor] = None
+        self.n = 0
+
+    @torch.no_grad()
+    def update(self, preds: Any, target: torch.Tensor) -> None:
+        del target
+        mu = _get(preds, "mu")
+        logvar = _get(preds, "logvar")
+        kl_mat = -0.5 * (1 + logvar - mu.pow(2) - torch.exp(logvar))
+        kl_dim_sum = kl_mat.sum(dim=0).detach().cpu()
+        self.kl_sum = kl_dim_sum if self.kl_sum is None else self.kl_sum + kl_dim_sum
+        self.n += mu.size(0)
+
+    def compute(self) -> int:
+        if self.kl_sum is None or self.n == 0:
+            return 0
+        return int(((self.kl_sum / self.n) > self.threshold).sum().item())
+
+
+def make_running_metrics(threshold: float = 0.01) -> Dict[str, Any]:
+    return {
+        "recon": RunningMeanMetric(recon_metric),
+        "kl": RunningMeanMetric(kl_metric),
+        "penalty": RunningMeanMetric(pen_metric),
+        "active_dims": ActiveDimsRunningMetric(threshold=threshold),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Training loop
+# -----------------------------------------------------------------------------
+
+def move_to_device(x: Any, device: torch.device) -> Any:
+    if torch.is_tensor(x):
+        return x.to(device)
+    if isinstance(x, dict):
+        return {k: move_to_device(v, device) for k, v in x.items()}
+    if isinstance(x, tuple):
+        return tuple(move_to_device(v, device) for v in x)
+    if isinstance(x, list):
+        return [move_to_device(v, device) for v in x]
+    return x
+
+
+def infer_batch_size(batch: Any) -> int:
+    if torch.is_tensor(batch):
+        return int(batch.shape[0])
+    if isinstance(batch, dict):
+        if "y" in batch and torch.is_tensor(batch["y"]):
+            return int(batch["y"].shape[0])
+        for value in batch.values():
+            try:
+                return infer_batch_size(value)
+            except (TypeError, IndexError):
+                pass
+    if isinstance(batch, (tuple, list)):
+        for value in batch:
+            try:
+                return infer_batch_size(value)
+            except (TypeError, IndexError):
+                pass
+    raise TypeError("Could not infer batch size.")
+
+
+def model_forward(model: nn.Module, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    # Dataset batches are {"x": {"fc": ..., "cov": ...}, "y": ..., "indices": ...}.
+    return model(batch["x"])
+
+
+def compute_loss(loss_fn: Callable[[Any, torch.Tensor], torch.Tensor], output: Any, batch: Dict[str, Any]) -> torch.Tensor:
+    return loss_fn(output, batch["y"])
+
+
+def update_metrics(metric_objs: Dict[str, Any], output: Any, batch: Dict[str, Any]) -> None:
+    target = batch["y"]
+    for metric in metric_objs.values():
+        metric.update(output, target)
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, data_loader: Iterable[Any], loss_fn: Callable[..., Any], device: torch.device) -> Tuple[float, Dict[str, float]]:
+    model.eval()
+    total_loss = 0.0
+    total_n = 0
+    metrics = make_running_metrics(threshold=0.01)
+
+    for batch in data_loader:
+        batch = move_to_device(batch, device)
+        output = model_forward(model, batch)
+        loss = compute_loss(loss_fn, output, batch)
+        batch_n = infer_batch_size(batch)
+        total_loss += float(loss.detach().cpu()) * batch_n
+        total_n += batch_n
+        update_metrics(metrics, output, batch)
+
+    metric_values = {k: v.compute() for k, v in metrics.items()}
+    return total_loss / max(total_n, 1), metric_values
+
+
+def fit_one_seed_graph(
+    seed_id: int,
+    train_dl: DataLoader,
+    val_dl: DataLoader,
+    masks: Sequence[torch.Tensor],
+    cov_dim: int,
+    latent_dim: int = 12,
+    lambda_pen: float = 0.1,
+    max_lr: float = 0.025270402,
+    epochs: int = 800,
+    patience: int = 30,
+    model_dir: Optional[os.PathLike[str] | str] = None,
+    device: Optional[str | torch.device] = None,
+) -> nn.Module:
+    print("\n---------------------------------")
+    print(
+        "FUNGVA model run:",
+        "latent_dim =", latent_dim,
+        "lambda_pen =", lambda_pen,
+        "seed =", seed_id,
+        "max_lr =", max_lr,
+    )
+    print("---------------------------------")
+
+    set_seed(seed_id)
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    print(f"Using device: {device}")
+
+    masks = [m.to(device=device, dtype=torch.float32) for m in masks]
+    loss_fn = make_vae_loss(lambda_pen)
+    model = FUNGVA_Trainer(latent_dim=latent_dim, cov_dim=cov_dim, masks=masks).to(device)
+
+    optimizer = Adam(model.parameters())
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=max_lr,
+        epochs=epochs,
+        steps_per_epoch=len(train_dl),
+    )
+
+    best_val_loss = float("inf")
+    best_state = copy.deepcopy(model.state_dict())
+    epochs_without_improvement = 0
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running_loss = 0.0
+        running_n = 0
+        train_metrics = make_running_metrics(threshold=0.01)
+
+        for batch in train_dl:
+            batch = move_to_device(batch, device)
+            optimizer.zero_grad(set_to_none=True)
+            output = model_forward(model, batch)
+            loss = compute_loss(loss_fn, output, batch)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            batch_n = infer_batch_size(batch)
+            running_loss += float(loss.detach().cpu()) * batch_n
+            running_n += batch_n
+            with torch.no_grad():
+                update_metrics(train_metrics, output, batch)
+
+        train_loss = running_loss / max(running_n, 1)
+        train_metric_values = {k: v.compute() for k, v in train_metrics.items()}
+        val_loss, val_metric_values = evaluate(model, val_dl, loss_fn, device)
+
+        print(
+            f"Epoch {epoch:04d}/{epochs} | "
+            f"train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | "
+            f"train_recon={train_metric_values['recon']:.6f} | "
+            f"train_kl={train_metric_values['kl']:.6f} | "
+            f"train_pen={train_metric_values['penalty']:.6f} | "
+            f"train_active_dims={train_metric_values['active_dims']} | "
+            f"val_recon={val_metric_values['recon']:.6f} | "
+            f"val_kl={val_metric_values['kl']:.6f} | "
+            f"val_pen={val_metric_values['penalty']:.6f} | "
+            f"val_active_dims={val_metric_values['active_dims']}"
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(model.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= patience:
+            print(f"Early stopping at epoch {epoch}; best_val_loss={best_val_loss:.6f}")
+            break
+
+    model.load_state_dict(best_state)
+
+    if model_dir is not None:
+        model_dir = Path(model_dir)
+        model_dir.mkdir(parents=True, exist_ok=True)
+        model_file = model_dir / f"FUNGVA_ld12_lam0.1_seed_{seed_id}.pt"
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "latent_dim": latent_dim,
+                "cov_dim": cov_dim,
+                "lambda_pen": lambda_pen,
+                "seed_id": seed_id,
+                "max_lr": max_lr,
+                "best_val_loss": best_val_loss,
+            },
+            model_file,
+        )
+        print(f"Saved best model to: {model_file}")
+
+    return model
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train FUNGVA ld12 lambda=0.1 as a standalone Python script.")
+    parser.add_argument("--workdir", default="~/fungva/working-dir/", help="Directory containing fc_train.rds, fc_val.rds, fc_test.rds, covariates.rds.")
+    parser.add_argument("--model-dir", default="FUNGVA_ld12_lam0.1", help="Directory for saved .pt files.")
+    parser.add_argument("--seeds", nargs="+", type=int, default=[101, 202, 303], help="Training seeds.")
+    parser.add_argument("--latent-dim", type=int, default=12)
+    parser.add_argument("--lambda-pen", type=float, default=0.1)
+    parser.add_argument("--max-lr", type=float, default=0.025270402)
+    parser.add_argument("--epochs", type=int, default=800)
+    parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument("--train-batch-size", type=int, default=16)
+    parser.add_argument("--eval-batch-size", type=int, default=15)
+    parser.add_argument("--device", default=None, help="Optional device override, e.g. cpu, cuda, cuda:0.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    train_dl, val_dl, _test_dl, masks, cov_dim = build_dataloaders(
+        workdir=args.workdir,
+        train_batch_size=args.train_batch_size,
+        eval_batch_size=args.eval_batch_size,
+    )
+
+    Path(args.model_dir).mkdir(parents=True, exist_ok=True)
+    for sd in args.seeds:
+        fit_one_seed_graph(
+            seed_id=sd,
+            train_dl=train_dl,
+            val_dl=val_dl,
+            masks=masks,
+            cov_dim=cov_dim,
+            latent_dim=args.latent_dim,
+            lambda_pen=args.lambda_pen,
+            max_lr=args.max_lr,
+            epochs=args.epochs,
+            patience=args.patience,
+            model_dir=args.model_dir,
+            device=args.device,
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,13 @@
+-tried running model, got errors with package incompatibility with R version and hpc system, of the torch package, specifically lantern
+
+-tried alternative packages like keras and reticulate, got version incompatibility errors again
+
+-tried python, converted the data into h5 and parquet format
+
+-notebooks didn’t work because of the nature of script sourcing
+
+-combined into single script per run, resolved data formatting errors, worked successfully
+
+-used vscode, doesn’t take long on hpc system, ~5 minutes
+
+-combined into 4 distinct script runs, 1 for main fungva model training, 2 comparison model training, and 1 evaluation run
